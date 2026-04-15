@@ -142,7 +142,7 @@
 #define ENABLE_DAILY_RECORDING  false   // Continuous recording (loop overwrite)
 #define RECORD_SEGMENT_SEC      300     // 5 minutes per file (300 seconds)
 #define MAX_DISK_USAGE_PCT      90      // Auto-delete oldest when disk > 90%
-#define ENABLE_MOTION_DETECTION false   // Motion-triggered recording (saves IRAM when disabled)
+#define ENABLE_MOTION_DETECTION true    // Lightweight luminance-based motion detection
 
 // 💡 TIP: Enable motion detection only if you're NOT using Bluetooth to save memory
 

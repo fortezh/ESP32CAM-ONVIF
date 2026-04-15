@@ -35,12 +35,47 @@ WebServer webConfigServer(WEB_PORT);
 // Eliminates heap fragmentation from String concatenation
 static char s_jsonBuf[1024];
 
+// === SECURITY: Rate limiting ===
+#define MAX_AUTH_FAILURES 5
+#define AUTH_LOCKOUT_MS   60000  // 60 second lockout
+static int s_authFailures = 0;
+static unsigned long s_lockoutStart = 0;
+
+// === SECURITY: Stream connection guard ===
+static volatile bool s_streamActive = false;
+
+// === Performance: Heap low-water mark ===
+static uint32_t s_minFreeHeap = UINT32_MAX;
+
+
+// Add security headers to prevent XSS, clickjacking, MIME sniffing
+static void addSecurityHeaders() {
+    webConfigServer.sendHeader("X-Content-Type-Options", "nosniff");
+    webConfigServer.sendHeader("X-Frame-Options", "SAMEORIGIN");
+    webConfigServer.sendHeader("X-XSS-Protection", "1; mode=block");
+    webConfigServer.sendHeader("Cache-Control", "no-store");
+}
 
 bool isAuthenticated(WebServer &server) {
+    // Rate limiting: lockout after repeated failures
+    if (s_authFailures >= MAX_AUTH_FAILURES) {
+        if (millis() - s_lockoutStart < AUTH_LOCKOUT_MS) {
+            server.send(429, "text/plain", "Too many attempts. Try again later.");
+            return false;
+        }
+        s_authFailures = 0;  // Reset after lockout period
+    }
     if (!server.authenticate(WEB_USER, WEB_PASS)) {
+        s_authFailures++;
+        if (s_authFailures >= MAX_AUTH_FAILURES) {
+            s_lockoutStart = millis();
+            Serial.println(F("[SECURITY] Auth lockout triggered"));
+        }
         server.requestAuthentication();
         return false;
     }
+    s_authFailures = 0;  // Reset on success
+    addSecurityHeaders();
     return true;
 }
 
@@ -70,6 +105,8 @@ void web_config_start() {
             "\"recording\":%s,"
             "\"sd_mounted\":%s,"
             "\"heap\":%u,"
+            "\"min_heap\":%u,"
+            "\"psram_free\":%u,"
             "\"uptime\":%lu,"
             "\"rssi\":%d,"
             "\"autoflash\":%s}",
@@ -80,6 +117,8 @@ void web_config_start() {
             sd_recorder_is_recording() ? "true" : "false",
             sd_recorder_is_mounted() ? "true" : "false",
             ESP.getFreeHeap(),
+            s_minFreeHeap,
+            ESP.getFreePsram(),
             millis() / 1000,
             WiFi.RSSI(),
             auto_flash_is_enabled() ? "true" : "false");
@@ -634,8 +673,8 @@ void web_config_start() {
             if (i > 0) json += ",";
             json += "{";
             json += "\"timestamp\":" + String(eventLog[idx].timestamp) + ",";
-            json += "\"type\":\"" + eventLog[idx].type + "\",";
-            json += "\"message\":\"" + eventLog[idx].message + "\"";
+            json += "\"type\":\"" + String(eventLog[idx].type) + "\",";
+            json += "\"message\":\"" + String(eventLog[idx].message) + "\"";
             json += "}";
         }
         
@@ -860,11 +899,20 @@ void web_config_start() {
     // === STREAM ENDPOINT ===
     webConfigServer.on("/stream", HTTP_GET, []() {
         if (!isAuthenticated(webConfigServer)) return;
+        
+        // Guard: only one concurrent stream client
+        if (s_streamActive) {
+            webConfigServer.send(503, "text/plain", "Stream busy - another client is connected");
+            return;
+        }
+        s_streamActive = true;
+        
         WiFiClient client = webConfigServer.client();
         
+        // Security: restrict CORS to same-origin (removed wildcard)
         String response = "HTTP/1.1 200 OK\r\n";
         response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n";
-        response += "Access-Control-Allow-Origin: *\r\n";
+        response += "X-Content-Type-Options: nosniff\r\n";
         response += "\r\n";
         client.print(response);
 
@@ -930,6 +978,7 @@ void web_config_start() {
         }
         
         Serial.println("[INFO] MJPEG Stream stopped");
+        s_streamActive = false;
     });
 
     // --- Snapshot endpoint ---
@@ -997,10 +1046,50 @@ void web_config_start() {
     });
     #endif // BLUETOOTH_ENABLED
     
+    // === OTA Firmware Update (with authentication) ===
+    webConfigServer.on("/api/update", HTTP_POST, []() {
+        if (!isAuthenticated(webConfigServer)) return;
+        bool success = !Update.hasError();
+        webConfigServer.send(200, "application/json", 
+            success ? "{\"success\":true}" : "{\"success\":false}");
+        if (success) {
+            delay(500);
+            ESP.restart();
+        }
+    }, []() {
+        // Auth check on upload start
+        if (!webConfigServer.authenticate(WEB_USER, WEB_PASS)) {
+            return;
+        }
+        HTTPUpload& upload = webConfigServer.upload();
+        if (upload.status == UPLOAD_FILE_START) {
+            Serial.printf("[OTA] Update: %s\n", upload.filename.c_str());
+            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_WRITE) {
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_END) {
+            if (Update.end(true)) {
+                Serial.printf("[OTA] Success: %u bytes\n", upload.totalSize);
+            } else {
+                Update.printError(Serial);
+            }
+        }
+    });
+
     webConfigServer.begin();
         Serial.println("[INFO] Web config server started.");
     }
 
     void web_config_loop() {
         webConfigServer.handleClient();
+        
+        // Track heap low-water mark for fragmentation monitoring
+        uint32_t freeHeap = ESP.getFreeHeap();
+        if (freeHeap < s_minFreeHeap) {
+            s_minFreeHeap = freeHeap;
+        }
     }

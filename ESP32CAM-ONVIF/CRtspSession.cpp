@@ -269,12 +269,12 @@ void CRtspSession::Handle_RtspDESCRIBE()
     
     if (m_StreamID == -1)
     {   // Stream not available
-        snprintf(Response,sizeof(Response),
+        snprintf(s_RtspResponse,sizeof(s_RtspResponse),
                  "RTSP/1.0 404 Stream Not Found\r\nCSeq: %s\r\n%s\r\n",
                  m_CSeq,
                  DateHeader());
 
-        socketsend(m_RtspClient,Response,strlen(Response));
+        socketsend(m_RtspClient,s_RtspResponse,strlen(s_RtspResponse));
         return;
     };
 

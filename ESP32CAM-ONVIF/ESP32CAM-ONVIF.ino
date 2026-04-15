@@ -103,6 +103,7 @@ void setup() {
   else status_led_wifi_connecting();
   
   Serial.println("[INFO] System Ready.");
+  Serial.printf("[INFO] Free Heap: %u bytes | PSRAM: %u bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
 }
 
 void loop() {
