@@ -527,7 +527,7 @@ Check the main project README for license information.
 - Inter Font - Rasmus Andersson
 - ESP32 Arduino Core
 
-**Developed with ❤️ for the ESP32-CAM community**
+**Developed with ❤️ for the ESP32-CAM community by John Varghese (J0X)**
 
 ---
 
