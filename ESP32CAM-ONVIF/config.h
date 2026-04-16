@@ -89,13 +89,13 @@
 
 // --- WiFi Station Mode Settings ---
 // Set these to your local network for automatic connection
-#define WIFI_SSID       "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID       "IQ-Home"
+#define WIFI_PASSWORD   "fortezh1"
 
 // --- Access Point (AP) Fallback Settings ---
 // If WiFi connection fails, device creates its own network
 #define AP_SSID         "ESP32CAM-ONVIF"
-#define AP_PASSWORD     "esp32cam"      // Minimum 8 characters
+#define AP_PASSWORD     "Jednadva3"      // Minimum 8 characters
 
 // --- Static IP Configuration [OPTIONAL] ---
 // Set STATIC_IP_ENABLED to false to use DHCP (automatic IP)
@@ -117,12 +117,12 @@
 // Credentials for Web UI, ONVIF, and RTSP access
 
 #define WEB_USER        "admin"
-#define WEB_PASS        "esp123"
+#define WEB_PASS        "Jednadva3"
 
 // ⚠️ SECURITY WARNING: Change default credentials before deploying!
 
 
-// ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+// ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━═════════════════════════════════════════════════════════════════════════════════════════┓
 // ┃ SECTION 5: CAMERA & VIDEO SETTINGS [OPTIONAL]                          ┃
 // ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 // Default camera settings (can be changed via Web UI at runtime)

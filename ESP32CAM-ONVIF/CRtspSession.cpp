@@ -23,10 +23,11 @@ CRtspSession::~CRtspSession()
 {
     closesocket(m_RtspClient);
     // Memory leak fix: Delete the WiFiClient if we own it
-    if (m_ClientPtr) {
-        delete m_ClientPtr;
-        m_ClientPtr = nullptr;
-    }
+    // Note: m_ClientPtr is managed externally, don't delete here
+    // if (m_ClientPtr) {
+    //     delete m_ClientPtr;
+    //     m_ClientPtr = nullptr;
+    // }
 };
 
 void CRtspSession::Init()
