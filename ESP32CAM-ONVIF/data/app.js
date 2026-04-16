@@ -41,6 +41,8 @@ function showToast(msg) {
 }
 
 // ==================== TABS ====================
+let _aiPreviewInterval = null;
+
 function setTab(id, event) {
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -52,6 +54,24 @@ function setTab(id, event) {
     if (id === 'sys') { updateSystemInfo(); updateSDInfo(); }
     if (id === 'events') updateEventLog();
     if (id === 'recordings') loadRecordings();
+    
+    // Handle AI Vision Tab Preview (runs a 1.5s refresh snapshot to save stream sockets)
+    const aiLive = el('ai-live-preview');
+    if (aiLive) {
+        if (id === 'ai') {
+            if (!_aiPreviewInterval) {
+                aiLive.src = `/snapshot?_cb=${Date.now()}`;
+                _aiPreviewInterval = setInterval(() => {
+                    aiLive.src = `/snapshot?_cb=${Date.now()}`;
+                }, 1500);
+            }
+        } else {
+            if (_aiPreviewInterval) {
+                clearInterval(_aiPreviewInterval);
+                _aiPreviewInterval = null;
+            }
+        }
+    }
 }
 
 // ==================== STREAM PERFORMANCE = MONITOR ====================
@@ -98,14 +118,24 @@ function updateStreamPerformance() {
 // ==================== CAMERA ====================
 function toggleStream() {
     const img = el('stream');
+    const offlineMsg = el('stream-offline-msg');
+    
     if (img.src.includes('/stream')) {
-        img.src = ""; // Stop stream
-        img.alt = "Paused";
+        img.removeAttribute('src'); // Stop stream
+        img.alt = "";
         el('status-text').innerText = "Paused";
+        if (offlineMsg) {
+            offlineMsg.style.display = 'block';
+            el('stream-offline-detail').innerText = "Stream paused";
+        }
     } else {
         img.src = "/stream?t=" + Date.now(); // Start with cache bust
-        img.alt = "Connecting...";
+        img.alt = "";
         el('status-text').innerText = "Connecting...";
+        if (offlineMsg) {
+            offlineMsg.style.display = 'block';
+            el('stream-offline-detail').innerText = "Connecting...";
+        }
     }
 }
 
@@ -126,7 +156,9 @@ if (streamImg) {
 let isRecording = false;
 let mediaRecorder;
 let recordedChunks = [];
-let recCanvas, recCtx, recLoop;
+let recCanvas, recCtx, recStream, recDrawInterval;
+let recStartTime = 0;
+let recTimerInterval = null;
 
 async function toggleRecord() {
     const mode = el('rec-mode').value;
@@ -135,8 +167,8 @@ async function toggleRecord() {
     if (!isRecording) {
         // Start
         if (mode === 'device') {
-            startClientRecord();
-            showToast("Video saving to Device ⬇️");
+            await startClientRecord();
+            showToast("Recording to Device... ⏺");
         } else {
             // SD Card
             await api('/api/record', { method: 'POST', body: JSON.stringify({ action: 'start' }) });
@@ -159,110 +191,218 @@ async function toggleRecord() {
     }
 }
 
-function startClientRecord() {
-    const img = el('stream');
+async function startClientRecord() {
+    const streamImg = el('stream');
 
-    // Dynamic Canvas Sizing
-    let w = img.naturalWidth;
-    let h = img.naturalHeight;
+    // Dynamic Canvas Sizing — use stream dimensions or default
+    let w = streamImg.naturalWidth;
+    let h = streamImg.naturalHeight;
 
     if (w === 0 || h === 0) {
-        console.warn("Stream not fully loaded, using default 640x480");
+        console.warn("Stream not loaded, using default 640x480");
         w = 640;
         h = 480;
     }
 
+    // Create offscreen canvas
     recCanvas = document.createElement('canvas');
     recCanvas.width = w;
     recCanvas.height = h;
     recCtx = recCanvas.getContext('2d');
 
-    console.log(`Starting Local Rec: ${w}x${h}`);
+    console.log(`[REC] Starting ${w}x${h}`);
 
-    const draw = () => {
+    // Capture stream from canvas at target FPS
+    const targetFPS = 10;
+    recStream = recCanvas.captureStream(targetFPS);
+
+    // Audio is typically served via RTSP/ONVIF directly from ESP32.
+    // Client-side recording will capture video feed only.
+    console.log('[REC] Recording video without local microphone audio');
+
+    // Draw frames onto canvas at fixed interval
+    // Strategy: draw the live <img> element which is continuously updated by MJPEG
+    // This works because <img> with multipart/x-mixed-replace updates its bitmap in-place
+    const frameMs = Math.round(1000 / targetFPS);
+    recDrawInterval = setInterval(() => {
         if (!isRecording) return;
-        if (img.complete && img.naturalWidth > 0) {
-            recCtx.drawImage(img, 0, 0, w, h);
+        try {
+            // Draw current stream frame
+            if (streamImg.complete && streamImg.naturalWidth > 0) {
+                recCtx.drawImage(streamImg, 0, 0, w, h);
+            }
+        } catch (e) {
+            // Tainted canvas fallback: fetch /snapshot instead
+            console.warn('[REC] Canvas tainted, switching to snapshot mode');
+            clearInterval(recDrawInterval);
+            startSnapshotDrawLoop(w, h, frameMs);
         }
-        requestAnimationFrame(draw);
-    };
-    draw();
+    }, frameMs);
 
-    const stream = recCanvas.captureStream(20); // 20 FPS
-
-    // Prioritize MP4 -> WebM -> VP9
-    let mime = 'video/webm';
+    // Choose best codec (prefer ones with audio support)
+    let mime = 'video/webm;codecs=vp8,opus';
     let ext = 'webm';
 
+    if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+        mime = 'video/webm;codecs=vp9';
+    }
     if (MediaRecorder.isTypeSupported('video/mp4')) {
         mime = 'video/mp4';
         ext = 'mp4';
-    } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
-        mime = 'video/webm;codecs=vp9';
     }
 
-    console.log("Recording using:", mime);
+    console.log("[REC] Codec:", mime);
 
     try {
-        mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
+        mediaRecorder = new MediaRecorder(recStream, {
+            mimeType: mime,
+            videoBitsPerSecond: 1500000 // 1.5 Mbps
+        });
     } catch (e) {
-        console.error("MediaRecorder fail, trying default:", e);
-        mediaRecorder = new MediaRecorder(stream);
+        console.error("[REC] MediaRecorder init failed, trying default:", e);
+        try {
+            mediaRecorder = new MediaRecorder(recStream);
+        } catch (e2) {
+            showToast('Recording not supported in this browser');
+            cleanupRecording();
+            return;
+        }
         ext = 'webm';
     }
 
     recordedChunks = [];
     mediaRecorder.ondataavailable = e => {
         if (e.data && e.data.size > 0) {
-            console.log('Chunk received:', e.data.size, 'bytes');
             recordedChunks.push(e.data);
         }
     };
 
     mediaRecorder.onstop = () => {
-        console.log('Recording stopped. Total chunks:', recordedChunks.length);
+        console.log('[REC] Stopped. Chunks:', recordedChunks.length);
+        stopRecTimer();
 
         if (recordedChunks.length === 0) {
             showToast('Recording failed - no data captured');
+            cleanupRecording();
             return;
         }
 
         const blob = new Blob(recordedChunks, { type: mime });
-        console.log('Created blob:', blob.size, 'bytes');
+        console.log('[REC] Blob:', blob.size, 'bytes');
 
-        if (blob.size === 0) {
-            showToast('Recording failed - empty file');
+        if (blob.size < 100) {
+            showToast('Recording failed - file too small');
+            cleanupRecording();
             return;
         }
 
+        // Trigger download
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `rec_${Date.now()}.${ext}`;
+        const ts = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+        a.download = `ESP32CAM_${ts}.${ext}`;
+        document.body.appendChild(a);
         a.click();
-        URL.revokeObjectURL(url);
-        showToast(`Saved ${(blob.size / 1024 / 1024).toFixed(2)} MB as .${ext.toUpperCase()}`);
+        document.body.removeChild(a);
+
+        // Delay revoke to ensure download starts
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+        const sizeMB = (blob.size / 1024 / 1024).toFixed(2);
+        showToast(`Saved ${sizeMB} MB as .${ext.toUpperCase()}`);
+
+        cleanupRecording();
     };
 
     mediaRecorder.onerror = (e) => {
-        console.error('MediaRecorder error:', e);
-        showToast('Recording error occurred');
+        console.error('[REC] Error:', e);
+        showToast('Recording error');
+        stopRecTimer();
+        cleanupRecording();
     };
 
-    // Start recording with timeslice to ensure data is collected
-    mediaRecorder.start(100); // Request data every 100ms
-    console.log('MediaRecorder started with state:', mediaRecorder.state);
+    // Use 1000ms timeslice — better file compatibility than 100ms
+    mediaRecorder.start(1000);
+    recStartTime = Date.now();
+    startRecTimer();
+    console.log('[REC] MediaRecorder state:', mediaRecorder.state);
+}
+
+// Fallback: fetch snapshots when canvas.drawImage(img) is tainted
+function startSnapshotDrawLoop(w, h, frameMs) {
+    let fetching = false;
+    recDrawInterval = setInterval(async () => {
+        if (!isRecording || fetching) return;
+        fetching = true;
+        try {
+            const resp = await fetch('/snapshot?t=' + Date.now());
+            if (!resp.ok) return;
+            const blob = await resp.blob();
+            const bmp = await createImageBitmap(blob);
+            recCtx.drawImage(bmp, 0, 0, w, h);
+            bmp.close();
+        } catch (e) {
+            // Ignore fetch errors during recording
+        }
+        fetching = false;
+    }, frameMs);
 }
 
 function stopClientRecord() {
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        console.log('Stopping MediaRecorder, state:', mediaRecorder.state);
+        console.log('[REC] Stopping, state:', mediaRecorder.state);
         mediaRecorder.stop();
-
-        // Stop all tracks in the stream
-        const stream = recCanvas.captureStream();
-        stream.getTracks().forEach(track => track.stop());
     }
+
+    // Stop the draw loop
+    if (recDrawInterval) {
+        clearInterval(recDrawInterval);
+        recDrawInterval = null;
+    }
+
+    // Stop all tracks on the captured stream
+    if (recStream) {
+        recStream.getTracks().forEach(track => track.stop());
+        recStream = null;
+    }
+}
+
+function cleanupRecording() {
+    if (recDrawInterval) {
+        clearInterval(recDrawInterval);
+        recDrawInterval = null;
+    }
+    if (recStream) {
+        recStream.getTracks().forEach(track => track.stop());
+        recStream = null;
+    }
+    recCanvas = null;
+    recCtx = null;
+    recordedChunks = [];
+}
+
+// Recording timer overlay
+function startRecTimer() {
+    const toast = el('rec-toast');
+    toast.classList.add('show');
+    recTimerInterval = setInterval(() => {
+        if (!isRecording) { stopRecTimer(); return; }
+        const elapsed = Math.floor((Date.now() - recStartTime) / 1000);
+        const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
+        const ss = String(elapsed % 60).padStart(2, '0');
+        const sizeMB = recordedChunks.reduce((sum, c) => sum + c.size, 0) / 1024 / 1024;
+        toast.innerText = `⏺ REC ${mm}:${ss} • ${sizeMB.toFixed(1)} MB`;
+    }, 1000);
+}
+
+function stopRecTimer() {
+    if (recTimerInterval) {
+        clearInterval(recTimerInterval);
+        recTimerInterval = null;
+    }
+    const toast = el('rec-toast');
+    setTimeout(() => toast.classList.remove('show'), 2000);
 }
 
 // ==================== FLASH ====================
@@ -371,11 +511,12 @@ async function updateEventLog() {
 
         d.events.reverse().forEach(e => {
             const timeStr = new Date(e.timestamp).toLocaleTimeString();
-            const icon = e.type === 'boot' ? '🟢' :
-                e.type === 'motion' ? '🚨' :
-                    e.type === 'recording' ? '🎥' :
-                        e.type === 'wifi' ? '📡' :
-                            e.type === 'auth' ? '🔐' : '⚠️';
+            const icon = e.type === 'boot' ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="var(--success)"><circle cx="12" cy="12" r="10"/></svg>' :
+                e.type === 'motion' ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>' :
+                    e.type === 'recording' ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="var(--danger)"><circle cx="12" cy="12" r="8"/></svg>' :
+                        e.type === 'wifi' ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0M1.42 9a16 16 0 0 1 21.16 0M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/></svg>' :
+                            e.type === 'auth' ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>' : 
+                                '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01"/></svg>';
 
             const item = document.createElement('div');
             item.className = 'event-item';
@@ -420,8 +561,8 @@ async function loadRecordings() {
                     <small>${sizeMB} MB • ${date}</small>
                 </div>
                 <div>
-                    <button class="btn" onclick="playRecording('${r.name}')">▶ Play</button>
-                    <button class="btn" onclick="deleteRecording('${r.name}')">🗑 Delete</button>
+                    <button class="btn" onclick="playRecording('${r.name}')" style="display:inline-flex; align-items:center; gap:4px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg> Play</button>
+                    <button class="btn" onclick="deleteRecording('${r.name}')" style="display:inline-flex; align-items:center; gap:4px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> Delete</button>
                 </div>
             `;
             list.appendChild(item);
@@ -479,7 +620,13 @@ async function runPingTest() {
 // ==================== QUICK ACTIONS ====================
 function toggleQuickActions() {
     const panel = el('quick-actions');
+    const bd = el('qa-backdrop');
     panel.classList.toggle('show');
+    if (panel.classList.contains('show')) {
+        if (bd) bd.style.display = 'block';
+    } else {
+        if (bd) bd.style.display = 'none';
+    }
 }
 
 function quickReboot() {
@@ -558,6 +705,54 @@ function ptzControl(action) {
 
 function ptzMove(pan, tilt) {
     api('/api/ptz/control', { method: 'POST', body: JSON.stringify({ pan, tilt }) });
+}
+
+let currentHardwarePan = 0;
+let currentHardwareTilt = 0;
+
+function ptzStep(axis, dir) {
+    const stepInput = el('ptz-step-size');
+    const stepSize = stepInput ? parseInt(stepInput.value) || 5 : 5;
+    
+    if (axis === 'pan') {
+       currentHardwarePan += dir * stepSize;
+       if(currentHardwarePan > 90) currentHardwarePan = 90;
+       if(currentHardwarePan < -90) currentHardwarePan = -90;
+    } else {
+       currentHardwareTilt += dir * stepSize;
+       if(currentHardwareTilt > 45) currentHardwareTilt = 45;
+       if(currentHardwareTilt < -45) currentHardwareTilt = -45;
+    }
+    ptzMove(currentHardwarePan, currentHardwareTilt);
+}
+
+function ptzHome() {
+    currentHardwarePan = 0; currentHardwareTilt = 0;
+    ptzControl('home');
+}
+
+let _patrolInterval = null;
+let _patrolDir = 1; // 1 for right, -1 for left
+function togglePatrol() {
+    const btn = el('btn-ptz-patrol');
+    if (_patrolInterval) {
+        clearInterval(_patrolInterval);
+        _patrolInterval = null;
+        btn.innerText = 'Start Patrol Sweep';
+        btn.classList.remove('btn-danger');
+        btn.classList.add('btn-primary');
+    } else {
+        btn.innerText = 'Stop Patrol Sweep';
+        btn.classList.remove('btn-primary');
+        btn.classList.add('btn-danger');
+        ptzHome(); // Reset to center before starting
+        _patrolInterval = setInterval(() => {
+            // Check bounds to reverse direction
+            if (currentHardwarePan >= 90) _patrolDir = -1;
+            if (currentHardwarePan <= -90) _patrolDir = 1;
+            ptzStep('pan', _patrolDir);
+        }, 2000); // Step every 2 seconds
+    }
 }
 
 // ==================== SETTINGS EXPORT / IMPORT ====================
@@ -830,8 +1025,36 @@ async function updateStatus() {
     if (d) {
         el('status-pill').classList.remove('offline');
         el('status-text').innerText = "Online";
-        el('val-uptime').innerText = Math.floor(d.uptime / 60) + "m";
-        el('val-heap').innerText = Math.round(d.heap / 1024) + "KB";
+        
+        // Human-readable uptime
+        const secs = d.uptime;
+        const days = Math.floor(secs / 86400);
+        const hours = Math.floor((secs % 86400) / 3600);
+        const mins = Math.floor((secs % 3600) / 60);
+        let uptimeStr = '';
+        if (days > 0) uptimeStr += days + 'd ';
+        if (hours > 0) uptimeStr += hours + 'h ';
+        uptimeStr += mins + 'm';
+        if (el('val-uptime')) el('val-uptime').innerText = uptimeStr;
+        if (el('sys-uptime')) el('sys-uptime').innerText = uptimeStr;
+        
+        const heapStr = Math.round(d.heap / 1024) + "KB";
+        if (el('val-heap')) el('val-heap').innerText = heapStr;
+        if (el('sys-heap')) el('sys-heap').innerText = heapStr;
+        
+        // Min heap (low-water mark)
+        if (d.min_heap !== undefined) {
+            const minHeapStr = Math.round(d.min_heap / 1024) + 'KB';
+            if (el('val-min-heap')) el('val-min-heap').innerText = minHeapStr;
+            if (el('sys-min-heap')) el('sys-min-heap').innerText = minHeapStr;
+        }
+        
+        // PSRAM
+        if (d.psram_free !== undefined) {
+            const psramStr = d.psram_free > 0 ? Math.round(d.psram_free / 1024) + 'KB' : 'N/A';
+            if (el('val-psram')) el('val-psram').innerText = psramStr;
+            if (el('sys-psram')) el('sys-psram').innerText = psramStr;
+        }
 
         // WiFi Signal Strength
         if (el('val-rssi') && d.rssi !== undefined) {
@@ -884,24 +1107,71 @@ async function updateStatus() {
 }
 
 // Status update loop
-setInterval(updateStatus, 2000);
+let statusInterval = setInterval(updateStatus, 2000);
+
+// ==================== BACKGROUND TAB VISIBILITY OPTIMIZATION ====================
+// Stop all ESP32 querying and disconnect MJPEG stream when the browser tab is hidden.
+// This heavily optimizes the ESP32 CPU load for NVR/ONVIF execution when the UI is inactive.
+document.addEventListener("visibilitychange", () => {
+    const img = el('stream');
+    if (document.hidden) {
+        console.log("WebUI Sleeping: Stopping polling and stream...");
+        clearInterval(statusInterval); // Stop REST API hits
+        if (img && img.src.includes('/stream')) {
+            img.setAttribute('data-resumesrc', 'true');
+            img.src = ''; // Sever HTTP connection instantly!
+        }
+    } else {
+        console.log("WebUI Waking up: Resuming...");
+        updateStatus(); // Ping immediately
+        statusInterval = setInterval(updateStatus, 2000);
+        if (img && img.getAttribute('data-resumesrc')) {
+            img.src = '/stream?t=' + Date.now(); // Restore HTTP connection
+            img.removeAttribute('data-resumesrc');
+        } else if (img && (!img.src || img.src === window.location.href || img.getAttribute('src') === '')) {
+            // Safe fallback
+            if (typeof toggleStream === 'function') toggleStream();
+            else img.src = '/stream?t=' + Date.now();
+        }
+    }
+});
 
 // ==================== STREAM WATCHDOG ====================
 streamImg.onerror = () => {
     console.log("Stream error/disconnect. Retrying...");
     el('status-text').innerText = "Reconnecting...";
     el('status-pill').classList.add('offline');
-    setTimeout(() => {
-        if (streamImg.src.includes('/stream')) {
-            streamImg.src = '/stream?t=' + Date.now();
-        }
-    }, 2000);
+    
+    // Show new prominent OFFLINE overlay
+    const overlay = el('stream-offline-overlay');
+    if (overlay) overlay.style.display = 'flex';
+    
+    const offlineMsg = el('stream-offline-msg');
+    if (offlineMsg) {
+        offlineMsg.style.display = 'block';
+        el('stream-offline-detail').innerText = "Connection lost. Retrying...";
+    }
+    
+    // Do not attempt to infinitely reconnect if we purposefully disconnected due to tab sleeping
+    if (!document.hidden) {
+        setTimeout(() => {
+            if (streamImg.src.includes('/stream')) {
+                streamImg.src = '/stream?t=' + Date.now();
+            }
+        }, 2000);
+    }
 };
 
 streamImg.onload = () => {
+    // Hide OFFLINE overlay when stream recovers
+    const overlay = el('stream-offline-overlay');
+    if (overlay) overlay.style.display = 'none';
+
+    const offlineMsg = el('stream-offline-msg');
+    if (offlineMsg) offlineMsg.style.display = 'none';
     el('status-pill').classList.remove('offline');
     el('status-text').innerText = "Online";
-}
+};
 
 // ==================== CLEANUP & OPTIMIZATION ====================
 function cleanup() {
@@ -1166,28 +1436,7 @@ function closeShortcutsHelp() {
 }
 
 // ==================== 3. PICTURE-IN-PICTURE ====================
-async function togglePiP() {
-    const video = el('stream');
-
-    try {
-        if (document.pictureInPictureElement) {
-            await document.exitPictureInPicture();
-            showToast('PiP disabled');
-        } else {
-            // Create video element from image stream
-            const videoEl = document.createElement('video');
-            videoEl.src = video.src;
-            videoEl.autoplay = true;
-            videoEl.muted = true;
-
-            await videoEl.requestPictureInPicture();
-            showToast('PiP enabled');
-        }
-    } catch (err) {
-        console.error('PiP failed:', err);
-        showToast('PiP not supported');
-    }
-}
+// Note: PiP function moved to Advanced Features section below.
 
 // ==================== 4. VIDEO FILTERS ====================
 const videoFilters = {
@@ -1615,6 +1864,80 @@ function initClientSideFeatures() {
 }
 
 // ==================== 10. OBJECT DETECTION (AI) ====================
+let _isPtzTracking = false;
+let _lastPtzTrackTime = 0;
+function togglePtzTracking(enabled) {
+    _isPtzTracking = enabled;
+    // Sync both checkboxes
+    if(el('ai-ptz-tracking')) el('ai-ptz-tracking').checked = enabled;
+    if(el('ai-ptz-tracking-ai-tab')) el('ai-ptz-tracking-ai-tab').checked = enabled;
+    if(enabled) {
+        if (!objectDetection.isEnabled) {
+            objectDetection.toggle(); // Turn on AI if it's off!
+        }
+        showToast('Human Auto-Tracking Enabled');
+    }
+}
+
+// ==================== GOOGLE DRIVE SYNC ====================
+async function syncToGoogleDrive() {
+    const token = localStorage.getItem('gdrive_token');
+    const statusEl = el('gdrive-status');
+    if (!token) {
+        showToast('Please enter Google Drive OAuth Access Token first');
+        return;
+    }
+    
+    statusEl.innerHTML = '<span class="ai-loading"></span> Fetching local recordings...';
+    try {
+        // Get list of recordings
+        const res = await fetch('/api/recordings');
+        const data = await res.json();
+        if(!data.files || data.files.length === 0) {
+            statusEl.innerText = 'No recordings found to sync.';
+            return;
+        }
+        statusEl.innerHTML = `<span class="ai-loading"></span> Found ${data.files.length} files. Starting upload...`;
+        
+        let successCount = 0;
+        for (let file of data.files) {
+            statusEl.innerHTML = `<span class="ai-loading"></span> Uploading ${file.n} (${(file.s/1024/1024).toFixed(2)} MB)...`;
+            
+            // Download from ESP32 locally to browser RAM
+            const videoBlobResp = await fetch(`/api/recordings/stream?file=${file.n}`);
+            const videoBlob = await videoBlobResp.blob();
+            
+            // Generate Google Drive Multipart Form Data
+            const metadata = {
+                name: file.n,
+                mimeType: 'video/mp4'
+            };
+            const form = new FormData();
+            form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+            form.append('file', videoBlob);
+            
+            // Upload to Google Drive using Browser Resources
+            const driveUploadReq = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+                method: 'POST',
+                headers: {
+                    'Authorization': 'Bearer ' + token
+                },
+                body: form
+            });
+            
+            if (driveUploadReq.ok) {
+                successCount++;
+            } else {
+                const errtxt = await driveUploadReq.text();
+                throw new Error('Upload failed: ' + errtxt);
+            }
+        }
+        statusEl.innerHTML = `✅ Successfully synced ${successCount} files!`;
+    } catch(err) {
+        statusEl.innerHTML = `<span style="color:var(--danger)">Error: ${err.message}</span>`;
+    }
+}
+
 const objectDetection = {
     model: null,
     isEnabled: false,
@@ -1684,13 +2007,16 @@ const objectDetection = {
 
         // Update button UI
         const btn = el('btn-detection');
+        const btnAi = el('btn-detection-ai-tab');
         if (btn) {
             if (this.isEnabled) {
                 btn.innerText = '🤖 Disable AI Detection';
                 btn.style.background = '#ef4444'; // Red when active
+                if(btnAi) { btnAi.innerText = '🤖 Disable AI Detection'; btnAi.style.background = '#ef4444'; }
             } else {
                 btn.innerText = '🤖 Enable AI Detection';
                 btn.style.background = ''; // Reset to primary
+                if(btnAi) { btnAi.innerText = '🤖 Enable AI Detection'; btnAi.style.background = ''; }
             }
         }
 
@@ -1730,8 +2056,13 @@ const objectDetection = {
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
 
                 // Draw detections
+                let trackBox = null;
                 predictions.forEach(prediction => {
                     const [x, y, width, height] = prediction.bbox;
+                    
+                    if (prediction.class === 'person' && _isPtzTracking) {
+                        trackBox = { x, y, w: width, h: height };
+                    }
 
                     // Scale coordinates to canvas size
                     const scaleX = canvas.width / img.naturalWidth;
@@ -1807,9 +2138,88 @@ const objectDetection = {
                     ctx.fillText(label, scaledX + 8, scaledY - 9);
                 });
 
-                // Update detection count
-                if (el('detection-count')) {
-                    el('detection-count').innerText = predictions.length + ' objects';
+                // PTZ Auto-Tracking Engine
+                if (_isPtzTracking && trackBox) {
+                    const now = Date.now();
+                    // Throttle to 2000ms minimum between moves to prevent ESP32 crash/spikes!
+                    if (now - _lastPtzTrackTime > 2000) {
+                        const imgWidth = canvas.width;
+                        const centerX = trackBox.x + (trackBox.w / 2);
+                        const scaledCenterX = centerX * (canvas.width / img.naturalWidth);
+                        
+                        let didMove = false;
+                        if (scaledCenterX < imgWidth * 0.35) {
+                            // Subject is heavily on the left
+                            ptzStep('pan', 1);
+                            didMove = true;
+                        } else if (scaledCenterX > imgWidth * 0.65) {
+                            // Subject is heavily on the right
+                            ptzStep('pan', -1);
+                            didMove = true;
+                        }
+                        
+                        if (didMove) {
+                            _lastPtzTrackTime = now;
+                        }
+                    }
+                }
+
+                // Update detection count + object names
+                const objNames = predictions.map(p => `${p.class} ${(p.score*100).toFixed(0)}%`);
+                const uniqueClasses = [...new Set(predictions.map(p => p.class))];
+                const countText = predictions.length + ' objects';
+                const listText = uniqueClasses.length > 0 ? uniqueClasses.join(', ') : '';
+                
+                if (el('detection-count')) el('detection-count').innerText = countText;
+                if (el('ai-tab-detection-count')) el('ai-tab-detection-count').innerText = countText;
+                
+                // Show detailed list in Dashboard
+                const dashList = el('detection-objects-list');
+                if (dashList) {
+                    if (objNames.length > 0) {
+                        dashList.style.display = 'block';
+                        dashList.innerHTML = objNames.map(n => `<span style="display:inline-block;background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.3);border-radius:4px;padding:2px 6px;margin:2px;font-size:0.75rem;">${n}</span>`).join('');
+                    } else {
+                        dashList.style.display = 'none';
+                        dashList.innerHTML = '';
+                    }
+                }
+                // Show in AI tab
+                const aiList = el('ai-tab-detection-list');
+                if (aiList) {
+                    if (objNames.length > 0) {
+                        aiList.style.display = 'block';
+                        aiList.innerHTML = objNames.map(n => `<span style="display:inline-block;background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.3);border-radius:4px;padding:2px 6px;margin:2px;font-size:0.75rem;">${n}</span>`).join('');
+                    } else {
+                        aiList.style.display = 'none';
+                        aiList.innerHTML = '';
+                    }
+                }
+
+                // AI Tab specific Canvas drawing
+                const aiCanvas = el('ai-live-detection-canvas');
+                if (aiCanvas && el('tab-ai').classList.contains('active')) {
+                    const aiPreview = el('ai-live-preview');
+                    if (aiPreview && aiPreview.naturalWidth > 0) {
+                        aiCanvas.width = aiPreview.clientWidth;
+                        aiCanvas.height = aiPreview.clientHeight;
+                        const aiCtx = aiCanvas.getContext('2d');
+                        aiCtx.clearRect(0, 0, aiCanvas.width, aiCanvas.height);
+                        
+                        predictions.forEach(prediction => {
+                            const [bx, by, bw, bh] = prediction.bbox;
+                            const sx = aiCanvas.width / aiPreview.naturalWidth;
+                            const sy = aiCanvas.height / aiPreview.naturalHeight;
+                            
+                            aiCtx.lineWidth = 2;
+                            aiCtx.strokeStyle = '#10b981';
+                            aiCtx.strokeRect(bx * sx, by * sy, bw * sx, bh * sy);
+                            
+                            aiCtx.fillStyle = '#10b981';
+                            aiCtx.font = '12px Inter, sans-serif';
+                            aiCtx.fillText(`${prediction.class} ${(prediction.score * 100).toFixed(0)}%`, bx * sx + 4, by * sy - 4);
+                        });
+                    }
                 }
 
             } catch (err) {
@@ -1851,3 +2261,502 @@ const objectDetection = {
 function toggleDetection() {
     objectDetection.toggle();
 }
+
+// ==================== AI VISION - GEMINI BYOK ====================
+// All processing happens in-browser. Zero ESP32 overhead.
+
+function saveApiKey() {
+    const key = el('ai-api-key').value.trim();
+    if (!key) { showToast('Please enter an API key'); return; }
+    localStorage.setItem('gemini_api_key', key);
+    showToast('API key saved securely in browser');
+}
+
+// Restore saved key on load
+(function initAiVision() {
+    const savedKey = localStorage.getItem('gemini_api_key');
+    if (savedKey && el('ai-api-key')) {
+        el('ai-api-key').value = savedKey;
+    }
+    renderAiHistory();
+})();
+
+let _aiAbort = null; // AbortController for cancelling requests
+
+async function aiAnalyze(prompt) {
+    if (!prompt || !prompt.trim()) {
+        showToast('Please enter a prompt');
+        return;
+    }
+    
+    const apiKey = localStorage.getItem('gemini_api_key');
+    if (!apiKey) {
+        showToast('Please save your Gemini API key first');
+        return;
+    }
+    
+    const output = el('ai-output');
+    const statusEl = el('ai-status');
+    const tokensEl = el('ai-tokens');
+    const btn = el('btn-ai-analyze');
+    
+    // Cancel any in-flight request
+    if (_aiAbort) _aiAbort.abort();
+    _aiAbort = new AbortController();
+    
+    // UI: loading state
+    output.innerHTML = '<span class="ai-loading"></span> Capturing snapshot and analyzing...';
+    statusEl.innerText = 'Analyzing...';
+    tokensEl.innerText = '';
+    btn.disabled = true;
+    btn.innerText = 'Analyzing...';
+    
+    try {
+        // 1. Capture current frame from stream
+        const img = el('stream');
+        let base64Data;
+        
+        if (img && img.src && img.src.includes('/stream') && img.naturalWidth > 0) {
+            // Capture from live stream via canvas
+            const canvas = document.createElement('canvas');
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+            canvas.getContext('2d').drawImage(img, 0, 0);
+            base64Data = canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
+        } else {
+            // Fallback: fetch snapshot directly
+            output.innerHTML = '<span class="ai-loading"></span> Fetching snapshot...';
+            const snapResp = await fetch('/snapshot');
+            if (!snapResp.ok) throw new Error('Failed to capture snapshot');
+            const blob = await snapResp.blob();
+            base64Data = await new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                reader.readAsDataURL(blob);
+            });
+        }
+        
+        // Show the captured image in the UI
+        if (el('ai-img-preview-container') && el('ai-img-preview')) {
+            el('ai-img-preview-container').style.display = 'flex';
+            el('ai-img-preview').src = 'data:image/jpeg;base64,' + base64Data;
+        }
+
+        output.innerHTML = '<span class="ai-loading"></span> Sending to Gemini...';
+        
+        // 2. Call Gemini API with streaming (SSE)
+        const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=${apiKey}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                signal: _aiAbort.signal,
+                body: JSON.stringify({
+                    contents: [{
+                        parts: [
+                            { text: prompt },
+                            { inline_data: { mime_type: 'image/jpeg', data: base64Data } }
+                        ]
+                    }]
+                })
+            }
+        );
+        
+        if (!response.ok) {
+            const errBody = await response.text();
+            let errMsg = `API Error ${response.status}`;
+            try {
+                const errJson = JSON.parse(errBody);
+                errMsg = errJson.error?.message || errMsg;
+            } catch(_) {}
+            throw new Error(errMsg);
+        }
+        
+        // 3. Stream the response
+        output.innerHTML = '';
+        let fullText = '';
+        let totalTokens = 0;
+        
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            buffer += decoder.decode(value, { stream: true });
+            
+            // Parse SSE lines
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // Keep incomplete line in buffer
+            
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                const jsonStr = line.slice(6).trim();
+                if (!jsonStr || jsonStr === '[DONE]') continue;
+                
+                try {
+                    const data = JSON.parse(jsonStr);
+                    
+                    // Extract text from candidates
+                    if (data.candidates && data.candidates[0]) {
+                        const parts = data.candidates[0].content?.parts;
+                        if (parts) {
+                            for (const part of parts) {
+                                if (part.text) {
+                                    fullText += part.text;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Extract token count
+                    if (data.usageMetadata) {
+                        totalTokens = data.usageMetadata.totalTokenCount || 0;
+                    }
+                } catch (parseErr) {
+                    // Skip malformed JSON chunks
+                }
+            }
+            
+            // Render with basic markdown formatting
+            output.innerHTML = renderMarkdown(fullText) + '<span class="ai-cursor"></span>';
+            output.scrollTop = output.scrollHeight;
+            statusEl.innerText = 'Streaming...';
+        }
+        
+        // Final render (remove cursor)
+        output.innerHTML = renderMarkdown(fullText);
+        statusEl.innerText = 'Complete';
+        if (totalTokens > 0) {
+            tokensEl.innerText = totalTokens + ' tokens';
+        }
+        
+        // Save to history
+        saveAiHistory(prompt, fullText);
+        
+    } catch (err) {
+        if (err.name === 'AbortError') {
+            output.innerHTML = '<span style="color:var(--text-muted)">Analysis cancelled.</span>';
+            statusEl.innerText = 'Cancelled';
+        } else {
+            output.innerHTML = `<span style="color:var(--danger)">Error: ${escapeHtml(err.message)}</span>`;
+            statusEl.innerText = 'Error';
+            console.error('AI Vision error:', err);
+        }
+    } finally {
+        btn.disabled = false;
+        btn.innerText = 'Analyze';
+        _aiAbort = null;
+    }
+}
+
+// Simple markdown renderer for AI output
+function renderMarkdown(text) {
+    let html = escapeHtml(text);
+    // Bold: **text**
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    // Italic: *text*
+    html = html.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>');
+    // Inline code: `code`
+    html = html.replace(/`([^`]+)`/g, '<code style="background:rgba(255,255,255,0.1);padding:1px 4px;border-radius:3px">$1</code>');
+    // Numbered lists
+    html = html.replace(/^(\d+)\.\s/gm, '<br>$1. ');
+    // Bullet lists
+    html = html.replace(/^[\-\*]\s/gm, '<br>• ');
+    // Headers
+    html = html.replace(/^### (.+)$/gm, '<br><strong style="font-size:1rem;color:var(--accent)">$1</strong>');
+    html = html.replace(/^## (.+)$/gm, '<br><strong style="font-size:1.1rem;color:var(--primary)">$1</strong>');
+    // Line breaks
+    html = html.replace(/\n/g, '<br>');
+    return html;
+}
+
+function escapeHtml(text) {
+    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+    return text.replace(/[&<>"']/g, c => map[c]);
+}
+
+// History management (localStorage, max 10)
+function saveAiHistory(prompt, response) {
+    let history = JSON.parse(localStorage.getItem('ai_history') || '[]');
+    history.unshift({
+        prompt: prompt,
+        response: response,
+        time: new Date().toISOString()
+    });
+    if (history.length > 10) history = history.slice(0, 10);
+    localStorage.setItem('ai_history', JSON.stringify(history));
+    renderAiHistory();
+}
+
+function renderAiHistory() {
+    const container = el('ai-history');
+    if (!container) return;
+    
+    const history = JSON.parse(localStorage.getItem('ai_history') || '[]');
+    
+    if (history.length === 0) {
+        container.innerHTML = '<span style="color:var(--text-muted)">No analyses yet</span>';
+        return;
+    }
+    
+    container.innerHTML = history.map((item, i) => {
+        const time = new Date(item.time).toLocaleString();
+        const preview = item.response.substring(0, 120) + (item.response.length > 120 ? '...' : '');
+        return `
+            <div class="ai-history-item" onclick="loadAiHistory(${i})">
+                <div class="ai-h-prompt">${escapeHtml(item.prompt.substring(0, 60))}</div>
+                <div class="ai-h-time">${time}</div>
+                <div class="ai-h-preview">${escapeHtml(preview)}</div>
+            </div>
+        `;
+    }).join('');
+}
+
+function loadAiHistory(index) {
+    const history = JSON.parse(localStorage.getItem('ai_history') || '[]');
+    if (history[index]) {
+        el('ai-output').innerHTML = renderMarkdown(history[index].response);
+        el('ai-status').innerText = 'Loaded from history';
+        el('ai-custom-prompt').value = history[index].prompt;
+    }
+}
+
+function clearAiHistory() {
+    if (!confirm('Clear all AI analysis history?')) return;
+    localStorage.removeItem('ai_history');
+    renderAiHistory();
+    showToast('AI history cleared');
+}
+
+// Auto-start stream on page load
+window.addEventListener('DOMContentLoaded', () => {
+    const img = el('stream');
+    if (!img.src || img.src === window.location.href || img.getAttribute('src') === '') {
+        toggleStream();
+    }
+    
+    // Load custom theme
+    const savedTheme = localStorage.getItem('ui-accent');
+    if (savedTheme) {
+        updateThemeColor(savedTheme);
+    }
+});
+
+// ==================== IMPRESSIVE FEATURES ====================
+
+// Custom Theme Handler
+function updateThemeColor(color) {
+    document.documentElement.style.setProperty('--primary', color);
+    localStorage.setItem('ui-accent', color);
+    const picker = el('theme-color-picker');
+    if (picker && picker.value !== color) {
+        picker.value = color; // sync picker UI reset
+    }
+}
+
+// Double-click to fullscreen
+window.addEventListener('DOMContentLoaded', () => {
+    const wrapper = el('video-wrapper');
+    if (wrapper) {
+        wrapper.addEventListener('dblclick', toggleFS);
+    }
+});
+
+// Quick Control APIs
+async function toggleOption(opt) {
+    // Determine the current checkbox state if available in the UI
+    const checkbox = el(`camera-${opt}`);
+    let newVal;
+    if (checkbox) {
+        checkbox.checked = !checkbox.checked;
+        newVal = checkbox.checked ? 1 : 0;
+    } else {
+        // Blind toggle fallback
+        newVal = 1;
+    }
+    
+    const payload = {};
+    payload[opt] = newVal;
+    
+    await api('/api/config', { method: 'POST', body: JSON.stringify(payload) });
+    showToast(`${opt} toggled`);
+}
+
+async function applyFrameSize(val) {
+    const resString = val === 10 ? 'HD' : 'QVGA'; // 10 is FRAMESIZE_HD, 5 is FRAMESIZE_QVGA
+    await api('/api/config', { method: 'POST', body: JSON.stringify({ resolution: resString }) });
+    showToast(`Resolution Set to ${resString}`);
+}
+
+// 2. Picture-in-Picture logic
+let pipVideo = null;
+let pipCanvas = null;
+let pipCtx = null;
+let pipInterval = null;
+
+async function togglePiP() {
+    if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+        return;
+    }
+
+    if (!('pictureInPictureEnabled' in document)) {
+        showToast("PiP not supported in this browser 😢");
+        return;
+    }
+
+    const img = el('stream');
+    if (!img || img.naturalWidth === 0) {
+        showToast("Stream must be playing first!");
+        return;
+    }
+
+    if (!pipVideo) {
+        pipCanvas = document.createElement('canvas');
+        pipCtx = pipCanvas.getContext('2d');
+        pipVideo = document.createElement('video');
+        pipVideo.muted = true;
+        pipVideo.autoplay = true;
+        pipVideo.playsInline = true;
+        
+        // Listeners to clean up loop
+        pipVideo.addEventListener('leavepictureinpicture', () => {
+            clearInterval(pipInterval);
+            pipVideo.pause();
+        });
+    }
+    
+    pipCanvas.width = img.naturalWidth || 640;
+    pipCanvas.height = img.naturalHeight || 480;
+    
+    if ("captureStream" in pipCanvas) {
+        pipVideo.srcObject = pipCanvas.captureStream(15);
+    } else if ("mozCaptureStream" in pipCanvas) {
+        pipVideo.srcObject = pipCanvas.mozCaptureStream(15);
+    }
+
+    // CRITICAL FIX: Start drawing loop for PiP before awaiting play()
+    if (pipInterval) clearInterval(pipInterval);
+    pipCtx.drawImage(img, 0, 0, pipCanvas.width, pipCanvas.height);
+    
+    pipInterval = setInterval(() => {
+        if (img.complete && img.naturalWidth > 0) {
+            pipCtx.drawImage(img, 0, 0, pipCanvas.width, pipCanvas.height);
+        }
+    }, 1000 / 15);
+
+    try {
+        await pipVideo.play();
+        await pipVideo.requestPictureInPicture();
+        showToast("Picture in Picture Started 🔲");
+    } catch (e) {
+        console.error("PiP Error:", e);
+        showToast("Error starting PiP!");
+        clearInterval(pipInterval);
+    }
+}
+
+// 3. Digital PTZ (Pan/Tilt/Zoom)
+let ptzZoom = 1;
+let ptzPanX = 0;
+let ptzPanY = 0;
+let isDraggingPTZ = false;
+let startX, startY;
+
+window.addEventListener('DOMContentLoaded', () => {
+    const wrapper = el('video-wrapper');
+    const feed = el('stream');
+    if (!wrapper || !feed) return;
+
+    // Mouse wheel zoom
+    wrapper.addEventListener('wheel', e => {
+        e.preventDefault();
+        ptzZoom += e.deltaY * -0.002;
+        ptzZoom = Math.min(Math.max(1, ptzZoom), 6); // Clamp 1x to 6x
+        applyPTZ();
+    });
+
+    // Panning logic
+    wrapper.addEventListener('mousedown', e => {
+        if (ptzZoom <= 1) return;
+        isDraggingPTZ = true;
+        startX = e.clientX - ptzPanX;
+        startY = e.clientY - ptzPanY;
+        feed.style.cursor = 'grabbing';
+    });
+    
+    // Touch support (mobile pinch/pan)
+    let initialPinchDistance = null;
+    let initialZoom = 1;
+    wrapper.addEventListener('touchstart', e => {
+        if (e.touches.length === 2) {
+            initialPinchDistance = Math.hypot(
+                e.touches[0].clientX - e.touches[1].clientX,
+                e.touches[0].clientY - e.touches[1].clientY
+            );
+            initialZoom = ptzZoom;
+        } else if (e.touches.length === 1 && ptzZoom > 1) {
+            isDraggingPTZ = true;
+            startX = e.touches[0].clientX - ptzPanX;
+            startY = e.touches[0].clientY - ptzPanY;
+        }
+    });
+
+    wrapper.addEventListener('touchmove', e => {
+        if (e.touches.length === 2 && initialPinchDistance) {
+            e.preventDefault(); // Stop page scaling
+            const dist = Math.hypot(
+                e.touches[0].clientX - e.touches[1].clientX,
+                e.touches[0].clientY - e.touches[1].clientY
+            );
+            const scale = dist / initialPinchDistance;
+            ptzZoom = Math.min(Math.max(1, initialZoom * scale), 6);
+            applyPTZ();
+        } else if (e.touches.length === 1 && isDraggingPTZ) {
+            e.preventDefault(); // Stop scroll
+            ptzPanX = e.touches[0].clientX - startX;
+            ptzPanY = e.touches[0].clientY - startY;
+            applyPTZ();
+        }
+    }, {passive: false});
+
+    window.addEventListener('touchend', () => {
+        isDraggingPTZ = false;
+        initialPinchDistance = null;
+    });
+
+    window.addEventListener('mouseup', () => {
+        isDraggingPTZ = false;
+        feed.style.cursor = 'grab';
+    });
+
+    window.addEventListener('mousemove', e => {
+        if (!isDraggingPTZ || ptzZoom === 1) return;
+        ptzPanX = e.clientX - startX;
+        ptzPanY = e.clientY - startY;
+        applyPTZ();
+    });
+
+    function applyPTZ() {
+        if (ptzZoom === 1) {
+            ptzPanX = 0; ptzPanY = 0;
+            feed.style.transform = `scale(1) translate(0px, 0px)`;
+            return;
+        }
+        
+        // Calculate boundaries so we don't pan out of the image completely
+        const rect = wrapper.getBoundingClientRect();
+        const maxPanX = (rect.width * ptzZoom - rect.width) / 2 / ptzZoom;
+        const maxPanY = (rect.height * ptzZoom - rect.height) / 2 / ptzZoom;
+        
+        ptzPanX = Math.min(Math.max(-maxPanX * 2, ptzPanX), maxPanX * 2);
+        ptzPanY = Math.min(Math.max(-maxPanY * 2, ptzPanY), maxPanY * 2);
+
+        // Uses transform-origin 0 0 from CSS, but visual center bounds might differ slightly based on object-fit
+        // The most robust way visually is simply translating the center point.
+        feed.style.transform = `scale(${ptzZoom}) translate(${ptzPanX / ptzZoom}px, ${ptzPanY / ptzZoom}px)`;
+    }
+});

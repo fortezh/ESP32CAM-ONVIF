@@ -31,14 +31,51 @@
 
 WebServer webConfigServer(WEB_PORT);
 
-// WEB_USER and WEB_PASS are defined in config.h
+// Shared JSON response buffer (single-threaded, reused across API handlers)
+// Eliminates heap fragmentation from String concatenation
+static char s_jsonBuf[1024];
 
+// === SECURITY: Rate limiting ===
+#define MAX_AUTH_FAILURES 5
+#define AUTH_LOCKOUT_MS   60000  // 60 second lockout
+static int s_authFailures = 0;
+static unsigned long s_lockoutStart = 0;
+
+// === SECURITY: Stream connection guard ===
+static volatile bool s_streamActive = false;
+
+// === Performance: Heap low-water mark ===
+static uint32_t s_minFreeHeap = UINT32_MAX;
+
+
+// Add security headers to prevent XSS, clickjacking, MIME sniffing
+static void addSecurityHeaders() {
+    webConfigServer.sendHeader("X-Content-Type-Options", "nosniff");
+    webConfigServer.sendHeader("X-Frame-Options", "SAMEORIGIN");
+    webConfigServer.sendHeader("X-XSS-Protection", "1; mode=block");
+    webConfigServer.sendHeader("Cache-Control", "no-store");
+}
 
 bool isAuthenticated(WebServer &server) {
+    // Rate limiting: lockout after repeated failures
+    if (s_authFailures >= MAX_AUTH_FAILURES) {
+        if (millis() - s_lockoutStart < AUTH_LOCKOUT_MS) {
+            server.send(429, "text/plain", "Too many attempts. Try again later.");
+            return false;
+        }
+        s_authFailures = 0;  // Reset after lockout period
+    }
     if (!server.authenticate(WEB_USER, WEB_PASS)) {
+        s_authFailures++;
+        if (s_authFailures >= MAX_AUTH_FAILURES) {
+            s_lockoutStart = millis();
+            Serial.println(F("[SECURITY] Auth lockout triggered"));
+        }
         server.requestAuthentication();
         return false;
     }
+    s_authFailures = 0;  // Reset on success
+    addSecurityHeaders();
     return true;
 }
 
@@ -59,20 +96,33 @@ void web_config_start() {
     // --- API ENDPOINTS ---
     webConfigServer.on("/api/status", HTTP_GET, []() {
         if (!isAuthenticated(webConfigServer)) return;
-        String json = "{";
-        json += "\"status\":\"Online\",";
-        json += "\"rtsp\":\"" + getRTSPUrl() + "\",";
-        json += "\"onvif\":\"http://" + WiFi.localIP().toString() + ":" + String(ONVIF_PORT) + "/onvif/device_service\",";
-        json += "\"onvif_enabled\":" + String(onvif_is_enabled() ? "true" : "false") + ",";
-        json += "\"motion\":" + String(motion_detected() ? "true" : "false") + ",";
-        json += "\"recording\":" + String(sd_recorder_is_recording() ? "true" : "false") + ",";
-        json += "\"sd_mounted\":" + String(sd_recorder_is_mounted() ? "true" : "false") + ",";
-        json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
-        json += "\"uptime\":" + String(millis() / 1000) + ",";
-        json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-        json += "\"autoflash\":" + String(auto_flash_is_enabled() ? "true" : "false");
-        json += "}";
-        webConfigServer.send(200, "application/json", json);
+        snprintf(s_jsonBuf, sizeof(s_jsonBuf),
+            "{\"status\":\"Online\","
+            "\"rtsp\":\"%s\","
+            "\"onvif\":\"http://%s:%d/onvif/device_service\","
+            "\"onvif_enabled\":%s,"
+            "\"motion\":%s,"
+            "\"recording\":%s,"
+            "\"sd_mounted\":%s,"
+            "\"heap\":%u,"
+            "\"min_heap\":%u,"
+            "\"psram_free\":%u,"
+            "\"uptime\":%lu,"
+            "\"rssi\":%d,"
+            "\"autoflash\":%s}",
+            getRTSPUrl().c_str(),
+            WiFi.localIP().toString().c_str(), ONVIF_PORT,
+            onvif_is_enabled() ? "true" : "false",
+            motion_detected() ? "true" : "false",
+            sd_recorder_is_recording() ? "true" : "false",
+            sd_recorder_is_mounted() ? "true" : "false",
+            ESP.getFreeHeap(),
+            s_minFreeHeap,
+            ESP.getFreePsram(),
+            millis() / 1000,
+            WiFi.RSSI(),
+            auto_flash_is_enabled() ? "true" : "false");
+        webConfigServer.send(200, "application/json", s_jsonBuf);
     });
 
     // --- Change Camera Settings ---
@@ -420,7 +470,7 @@ void web_config_start() {
         json += ",\"bluetooth\":{";
         json += "\"enabled\":" + String(appSettings.btEnabled ? "true" : "false") + ",";
         json += "\"stealth\":" + String(appSettings.btStealthMode ? "true" : "false") + ",";
-        json += "\"mac\":\"" + appSettings.btPresenceMac + "\",";
+        json += "\"mac\":\"" + String(appSettings.btPresenceMac) + "\",";
         json += "\"timeout\":" + String(appSettings.btPresenceTimeout) + ",";
         json += "\"gain\":" + String(appSettings.btMicGain) + ",";
         json += "\"audioSource\":" + String(appSettings.audioSource);
@@ -477,7 +527,7 @@ void web_config_start() {
             JsonObject bt = doc["bluetooth"];
             if (bt.containsKey("enabled")) appSettings.btEnabled = bt["enabled"];
             if (bt.containsKey("stealth")) appSettings.btStealthMode = bt["stealth"];
-            if (bt.containsKey("mac")) appSettings.btPresenceMac = bt["mac"].as<String>();
+            if (bt.containsKey("mac")) strncpy(appSettings.btPresenceMac, bt["mac"] | "", sizeof(appSettings.btPresenceMac) - 1);
             if (bt.containsKey("timeout")) appSettings.btPresenceTimeout = bt["timeout"];
             if (bt.containsKey("gain")) appSettings.btMicGain = bt["gain"];
             if (bt.containsKey("audioSource")) appSettings.audioSource = (AudioSource)bt["audioSource"].as<int>();
@@ -590,21 +640,23 @@ void web_config_start() {
     });
 
     // ==================== EVENT LOG ====================
-    #define MAX_EVENTS 100
+    #define MAX_EVENTS 50
     struct LogEvent {
         unsigned long timestamp;
-        String type;
-        String message;
+        char type[12];       // "boot", "motion", "error", etc. (was heap-allocated String)
+        char message[64];    // Fixed buffer, no heap fragmentation (was heap-allocated String)
     };
     static LogEvent eventLog[MAX_EVENTS];
     static int eventCount = 0;
     static int eventIndex = 0;
     
     // Helper to add event
-    auto addEvent = [](String type, String message) {
+    auto addEvent = [](const char* type, const char* message) {
         eventLog[eventIndex].timestamp = millis();
-        eventLog[eventIndex].type = type;
-        eventLog[eventIndex].message = message;
+        strncpy(eventLog[eventIndex].type, type, sizeof(eventLog[eventIndex].type) - 1);
+        eventLog[eventIndex].type[sizeof(eventLog[eventIndex].type) - 1] = '\0';
+        strncpy(eventLog[eventIndex].message, message, sizeof(eventLog[eventIndex].message) - 1);
+        eventLog[eventIndex].message[sizeof(eventLog[eventIndex].message) - 1] = '\0';
         eventIndex = (eventIndex + 1) % MAX_EVENTS;
         if (eventCount < MAX_EVENTS) eventCount++;
     };
@@ -621,8 +673,8 @@ void web_config_start() {
             if (i > 0) json += ",";
             json += "{";
             json += "\"timestamp\":" + String(eventLog[idx].timestamp) + ",";
-            json += "\"type\":\"" + eventLog[idx].type + "\",";
-            json += "\"message\":\"" + eventLog[idx].message + "\"";
+            json += "\"type\":\"" + String(eventLog[idx].type) + "\",";
+            json += "\"message\":\"" + String(eventLog[idx].message) + "\"";
             json += "}";
         }
         
@@ -715,15 +767,10 @@ void web_config_start() {
     // --- Ping Test ---
     webConfigServer.on("/api/network/ping", HTTP_GET, []() {
         if (!isAuthenticated(webConfigServer)) return;
-        
-        unsigned long timestamp = millis();
-        String json = "{";
-        json += "\"timestamp\":" + String(timestamp) + ",";
-        json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-        json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
-        json += "}";
-        
-        webConfigServer.send(200, "application/json", json);
+        snprintf(s_jsonBuf, sizeof(s_jsonBuf),
+            "{\"timestamp\":%lu,\"rssi\":%d,\"ip\":\"%s\"}",
+            millis(), WiFi.RSSI(), WiFi.localIP().toString().c_str());
+        webConfigServer.send(200, "application/json", s_jsonBuf);
     });
     
     // --- Bandwidth Test ---
@@ -787,15 +834,13 @@ void web_config_start() {
     // --- WiFi API Endpoints ---
     webConfigServer.on("/api/wifi/status", HTTP_GET, []() {
         if (!isAuthenticated(webConfigServer)) return;
-        
-        String json = "{";
-        json += "\"connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-        json += "\"ssid\":\"" + wifiManager.getSSID() + "\",";
-        json += "\"ip\":\"" + wifiManager.getLocalIP().toString() + "\",";
-        json += "\"mode\":\"" + String(wifiManager.isInAPMode() ? "AP" : "STA") + "\"";
-        json += "}";
-        
-        webConfigServer.send(200, "application/json", json);
+        snprintf(s_jsonBuf, sizeof(s_jsonBuf),
+            "{\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"mode\":\"%s\"}",
+            WiFi.status() == WL_CONNECTED ? "true" : "false",
+            wifiManager.getSSID().c_str(),
+            wifiManager.getLocalIP().toString().c_str(),
+            wifiManager.isInAPMode() ? "AP" : "STA");
+        webConfigServer.send(200, "application/json", s_jsonBuf);
     });
     
     webConfigServer.on("/api/wifi/scan", HTTP_GET, []() {
@@ -808,7 +853,7 @@ void web_config_start() {
         for (int i = 0; i < networksFound; i++) {
             if (i > 0) json += ",";
             json += "{";
-            json += "\"ssid\":\"" + networks[i].ssid + "\",";
+            json += "\"ssid\":\"" + String(networks[i].ssid) + "\",";
             json += "\"rssi\":" + String(networks[i].rssi) + ",";
             json += "\"encType\":" + String(networks[i].encType);
             json += "}";
@@ -854,11 +899,20 @@ void web_config_start() {
     // === STREAM ENDPOINT ===
     webConfigServer.on("/stream", HTTP_GET, []() {
         if (!isAuthenticated(webConfigServer)) return;
+        
+        // Guard: only one concurrent stream client
+        if (s_streamActive) {
+            webConfigServer.send(503, "text/plain", "Stream busy - another client is connected");
+            return;
+        }
+        s_streamActive = true;
+        
         WiFiClient client = webConfigServer.client();
         
+        // Security: restrict CORS to same-origin (removed wildcard)
         String response = "HTTP/1.1 200 OK\r\n";
         response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n";
-        response += "Access-Control-Allow-Origin: *\r\n";
+        response += "X-Content-Type-Options: nosniff\r\n";
         response += "\r\n";
         client.print(response);
 
@@ -900,18 +954,31 @@ void web_config_start() {
             
             size_t dataLen = fb->len; // Cache before releasing!
             size_t hlen = client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", dataLen);
-            size_t wlen = client.write(fb->buf, dataLen);
+            
+            // Implement chunked write to prevent WiFiClient buffer drops on large frames
+            size_t wlen = 0;
+            const size_t chunkSize = 2048;
+            for (size_t i = 0; i < dataLen; i += chunkSize) {
+                size_t toWrite = (dataLen - i < chunkSize) ? (dataLen - i) : chunkSize;
+                size_t written = client.write(fb->buf + i, toWrite);
+                if (written != toWrite) {
+                    break;
+                }
+                wlen += written;
+            }
+            
             client.print("\r\n");
             
             esp_camera_fb_return(fb); // Release immediately
             
             if (wlen != dataLen) {
-                 Serial.println("[WARN] Stream write failed (Client disconnected?)");
+                 Serial.printf("[WARN] Stream write failed (Sent %u of %u bytes). Client disconnected?\n", wlen, dataLen);
                  break;
             }
         }
         
         Serial.println("[INFO] MJPEG Stream stopped");
+        s_streamActive = false;
     });
 
     // --- Snapshot endpoint ---
@@ -934,7 +1001,7 @@ void web_config_start() {
         String json = "{";
         json += "\"enabled\":" + String(appSettings.btEnabled ? "true" : "false") + ",";
         json += "\"stealth\":" + String(appSettings.btStealthMode ? "true" : "false") + ",";
-        json += "\"mac\":\"" + appSettings.btPresenceMac + "\",";
+        json += "\"mac\":\"" + String(appSettings.btPresenceMac) + "\",";
         json += "\"userPresent\":" + String(btManager.isUserPresent() ? "true" : "false") + ",";
         json += "\"audioSource\":" + String(appSettings.audioSource) + ",";
         json += "\"gain\":" + String(appSettings.btMicGain) + ",";
@@ -954,7 +1021,7 @@ void web_config_start() {
         
         if(doc.containsKey("enabled")) appSettings.btEnabled = doc["enabled"];
         if(doc.containsKey("stealth")) appSettings.btStealthMode = doc["stealth"];
-        if(doc.containsKey("mac")) appSettings.btPresenceMac = doc["mac"].as<String>();
+        if(doc.containsKey("mac")) strncpy(appSettings.btPresenceMac, doc["mac"] | "", sizeof(appSettings.btPresenceMac) - 1);
         if(doc.containsKey("gain")) appSettings.btMicGain = doc["gain"];
         if(doc.containsKey("timeout")) appSettings.btPresenceTimeout = doc["timeout"];
         if(doc.containsKey("audioSource")) {
@@ -979,10 +1046,50 @@ void web_config_start() {
     });
     #endif // BLUETOOTH_ENABLED
     
+    // === OTA Firmware Update (with authentication) ===
+    webConfigServer.on("/api/update", HTTP_POST, []() {
+        if (!isAuthenticated(webConfigServer)) return;
+        bool success = !Update.hasError();
+        webConfigServer.send(200, "application/json", 
+            success ? "{\"success\":true}" : "{\"success\":false}");
+        if (success) {
+            delay(500);
+            ESP.restart();
+        }
+    }, []() {
+        // Auth check on upload start
+        if (!webConfigServer.authenticate(WEB_USER, WEB_PASS)) {
+            return;
+        }
+        HTTPUpload& upload = webConfigServer.upload();
+        if (upload.status == UPLOAD_FILE_START) {
+            Serial.printf("[OTA] Update: %s\n", upload.filename.c_str());
+            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_WRITE) {
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_END) {
+            if (Update.end(true)) {
+                Serial.printf("[OTA] Success: %u bytes\n", upload.totalSize);
+            } else {
+                Update.printError(Serial);
+            }
+        }
+    });
+
     webConfigServer.begin();
         Serial.println("[INFO] Web config server started.");
     }
 
     void web_config_loop() {
         webConfigServer.handleClient();
+        
+        // Track heap low-water mark for fragmentation monitoring
+        uint32_t freeHeap = ESP.getFreeHeap();
+        if (freeHeap < s_minFreeHeap) {
+            s_minFreeHeap = freeHeap;
+        }
     }
